@@ -1,0 +1,23 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+
+  chroma:
+    image: chromadb/chroma:1.5.9
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /chroma/chroma
+      ANONYMIZED_TELEMETRY: "FALSE"
+    ports:
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+
+volumes:
+  redis-data:
+  chroma-data:
