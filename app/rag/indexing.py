@@ -5,7 +5,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.config import Settings
-from app.rag.components import create_vector_store
+from app.rag.components import CHROMA_COLLECTION_NAME, create_vector_store
 
 
 def index_transcript(
@@ -16,6 +16,13 @@ def index_transcript(
     title: str,
     transcript: str,
     meeting_date: datetime | None,
+    file_name: str | None = None,
+    file_type: str | None = None,
+    file_size: int | None = None,
+    uploaded_at: datetime | None = None,
+    indexed_at: datetime | None = None,
+    original_file_path: str | None = None,
+    cleaned_text_path: str | None = None,
 ) -> int:
     splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
         encoding_name="cl100k_base",
@@ -36,6 +43,17 @@ def index_transcript(
                 "meeting_date": date_value,
                 "chunk_index": index,
                 "indexing_task_id": str(task_id),
+                "file_name": file_name or "",
+                "file_type": file_type or "",
+                "file_size": file_size if file_size is not None else 0,
+                "uploaded_at": uploaded_at.isoformat() if uploaded_at else "",
+                "status": "ready",
+                "indexed_at": indexed_at.isoformat() if indexed_at else "",
+                "chunk_count": len(chunks),
+                "error_message": "",
+                "original_file_path": original_file_path or "",
+                "cleaned_text_path": cleaned_text_path or "",
+                "chroma_collection": CHROMA_COLLECTION_NAME,
             },
         )
         for index, chunk in enumerate(chunks)

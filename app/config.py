@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, SecretStr
@@ -17,6 +18,8 @@ class Settings(BaseSettings):
     api_v1_prefix: str = "/api/v1"
     database_backend: Literal["memory", "sqlserver"] = "memory"
     indexing_mode: Literal["local", "celery"] = "local"
+    transcript_storage_directory: Path = Path("storage/transcripts")
+    chroma_persist_directory: Path = Path("storage/chroma")
     sqlserver_connection_string: str | None = None
     llm_api_key: SecretStr | None = None
     llm_base_url: str | None = None
@@ -29,7 +32,7 @@ class Settings(BaseSettings):
     llm_top_p: float = Field(default=0.9, ge=0.0, le=1.0)
     llm_max_tokens: int = Field(default=1000, ge=1)
     redis_url: str = "redis://localhost:6379/0"
-    chroma_host: str = "localhost"
+    chroma_host: str | None = None
     chroma_port: int = Field(default=8001, ge=1, le=65535)
 
 

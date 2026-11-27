@@ -1,11 +1,11 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import UUID
 
 from redis import Redis
 
 from app.config import get_settings
-from app.rag.components import create_chroma_client
+from app.rag.components import CHROMA_COLLECTION_NAME, create_chroma_client
 from app.rag.indexing import index_transcript
 from app.repositories.sqlserver_meeting_repository import SqlServerMeetingRepository
 from app.workers.celery_app import celery_app
@@ -39,11 +39,12 @@ def index_meeting(
 
     try:
         repository = _create_status_repository()
+        meeting = repository.get(meeting_id) if repository is not None else None
         if repository is not None:
             repository.set_indexing_status(
                 meeting_id,
                 indexing_task_id,
-                "indexing",
+                "processing",
             )
 
         with redis_client.lock(
@@ -58,6 +59,7 @@ def index_meeting(
             parsed_meeting_date = (
                 datetime.fromisoformat(meeting_date) if meeting_date else None
             )
+            indexed_at = datetime.now(timezone.utc)
             chunk_count = index_transcript(
                 settings=settings,
                 meeting_id=meeting_id,
@@ -65,15 +67,26 @@ def index_meeting(
                 title=title,
                 transcript=transcript,
                 meeting_date=parsed_meeting_date,
+                file_name=meeting.file_name if meeting else None,
+                file_type=meeting.file_type if meeting else None,
+                file_size=meeting.file_size if meeting else None,
+                uploaded_at=meeting.uploaded_at if meeting else None,
+                indexed_at=indexed_at,
+                original_file_path=(
+                    meeting.original_file_path if meeting else None
+                ),
+                cleaned_text_path=meeting.cleaned_text_path if meeting else None,
             )
 
         if repository is not None:
             repository.set_indexing_status(
                 meeting_id,
                 indexing_task_id,
-                "indexed",
+                "ready",
+                indexed_at=indexed_at,
+                chunk_count=chunk_count,
             )
-        return {"status": "indexed", "chunks": chunk_count}
+        return {"status": "ready", "chunks": chunk_count}
     except Exception as error:
         message = f"Indexing failed ({type(error).__name__}). Check worker logs."
         logger.error("Indexing failed for meeting %s (%s)", meeting_id, type(error).__name__)
@@ -113,7 +126,7 @@ def delete_meeting_vectors(meeting_id: int, task_id: str) -> dict[str, str]:
                 return {"status": "superseded"}
 
             collection = create_chroma_client(settings).get_or_create_collection(
-                name="meeting_transcripts",
+                name=CHROMA_COLLECTION_NAME,
                 metadata={"hnsw:space": "cosine"},
             )
             collection.delete(where={"meeting_id": meeting_id})

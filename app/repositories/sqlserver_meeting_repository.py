@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -13,6 +14,7 @@ from app.schemas.meeting import (
     MeetingDeleteResponse,
     MeetingIndexSummary,
     MeetingResponse,
+    MeetingUploadMetadata,
     MeetingUpdate,
 )
 
@@ -37,7 +39,18 @@ class SqlServerMeetingRepository:
             updated_at=values["UpdatedAt"],
             indexing_task_id=values["IndexingTaskId"],
             indexing_status=values["IndexingStatus"],
+            status=values["IndexingStatus"],
             indexing_error=values["IndexingError"],
+            error_message=values["IndexingError"],
+            file_name=values["FileName"],
+            file_type=values["FileType"],
+            file_size=values["FileSize"],
+            uploaded_at=values["UploadedAt"],
+            indexed_at=values["IndexedAt"],
+            chunk_count=values["ChunkCount"],
+            original_file_path=values["OriginalFilePath"],
+            cleaned_text_path=values["CleanedTextPath"],
+            chroma_collection=values["ChromaCollection"],
         )
 
     def check_connection(self) -> None:
@@ -168,11 +181,41 @@ class SqlServerMeetingRepository:
         indexing_task_id: UUID,
         status: IndexingStatus,
         error: str | None = None,
+        *,
+        indexed_at: datetime | None = None,
+        chunk_count: int | None = None,
     ) -> None:
         with self._engine.begin() as connection:
             connection.exec_driver_sql(
-                "EXEC dbo.Meeting_SetIndexingStatus ?, ?, ?, ?",
-                (meeting_id, str(indexing_task_id), status, error),
+                "EXEC dbo.Meeting_SetIndexingStatus ?, ?, ?, ?, ?, ?",
+                (
+                    meeting_id,
+                    str(indexing_task_id),
+                    status,
+                    error,
+                    indexed_at,
+                    chunk_count,
+                ),
+            )
+
+    def set_upload_metadata(
+        self,
+        meeting_id: int,
+        metadata: MeetingUploadMetadata,
+    ) -> None:
+        with self._engine.begin() as connection:
+            connection.exec_driver_sql(
+                "EXEC dbo.Meeting_SetUploadMetadata ?, ?, ?, ?, ?, ?, ?, ?",
+                (
+                    meeting_id,
+                    metadata.file_name,
+                    metadata.file_type,
+                    metadata.file_size,
+                    metadata.uploaded_at,
+                    metadata.original_file_path,
+                    metadata.cleaned_text_path,
+                    metadata.chroma_collection,
+                ),
             )
 
     def delete(self, meeting_id: int) -> MeetingDeleteResponse:

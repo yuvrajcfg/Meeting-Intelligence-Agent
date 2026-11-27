@@ -11,6 +11,7 @@ from app.schemas.meeting import (
     MeetingIndexSummary,
     IndexingStatus,
     MeetingResponse,
+    MeetingUploadMetadata,
     MeetingUpdate,
 )
 
@@ -33,7 +34,8 @@ class InMemoryMeetingRepository:
                 created_at=now,
                 updated_at=now,
                 indexing_task_id=indexing_task_id,
-                indexing_status="queued",
+                indexing_status="pending",
+                status="pending",
                 **meeting.model_dump(),
             )
             self._next_id += 1
@@ -112,8 +114,10 @@ class InMemoryMeetingRepository:
                 created_at=existing.created_at,
                 updated_at=datetime.now(timezone.utc),
                 indexing_task_id=indexing_task_id,
-                indexing_status="queued",
+                indexing_status="pending",
+                status="pending",
                 indexing_error=None,
+                error_message=None,
                 **meeting.model_dump(),
             )
             self._meetings[meeting_id] = updated
@@ -131,12 +135,32 @@ class InMemoryMeetingRepository:
             queued = meeting.model_copy(
                 update={
                     "indexing_task_id": indexing_task_id,
-                    "indexing_status": "queued",
+                    "indexing_status": "pending",
+                    "status": "pending",
                     "indexing_error": None,
+                    "error_message": None,
+                    "indexed_at": None,
+                    "chunk_count": None,
                 }
             )
             self._meetings[meeting_id] = queued
         return queued
+
+    def set_upload_metadata(
+        self,
+        meeting_id: int,
+        metadata: MeetingUploadMetadata,
+    ) -> None:
+        with self._lock:
+            meeting = self._meetings.get(meeting_id)
+            if meeting is None:
+                raise MeetingNotFoundError(meeting_id)
+            self._meetings[meeting_id] = meeting.model_copy(
+                update={
+                    **metadata.model_dump(),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
 
     def set_indexing_status(
         self,
@@ -144,13 +168,24 @@ class InMemoryMeetingRepository:
         indexing_task_id: UUID,
         status: IndexingStatus,
         error: str | None = None,
+        *,
+        indexed_at: datetime | None = None,
+        chunk_count: int | None = None,
     ) -> None:
         with self._lock:
             meeting = self._meetings.get(meeting_id)
             if meeting is None or meeting.indexing_task_id != indexing_task_id:
                 return
             self._meetings[meeting_id] = meeting.model_copy(
-                update={"indexing_status": status, "indexing_error": error}
+                update={
+                    "indexing_status": status,
+                    "status": status,
+                    "indexing_error": error,
+                    "error_message": error,
+                    "indexed_at": indexed_at,
+                    "chunk_count": chunk_count,
+                    "updated_at": datetime.now(timezone.utc),
+                },
             )
 
     def delete(self, meeting_id: int) -> MeetingDeleteResponse:

@@ -2,6 +2,7 @@ import re
 from html import unescape
 from io import BytesIO
 from pathlib import Path
+from uuid import uuid4
 from zipfile import BadZipFile
 
 from docx import Document
@@ -127,3 +128,47 @@ def extract_transcript(filename: str, content: bytes) -> str:
             "Extracted transcript text exceeds the 1,000,000-character limit."
         )
     return transcript
+
+
+def store_original_transcript(
+    *,
+    meeting_id: int,
+    filename: str,
+    content: bytes,
+    storage_directory: Path,
+) -> Path:
+    original_name = Path(filename).name
+    extension = Path(original_name).suffix.lower()
+    if extension not in SUPPORTED_TRANSCRIPT_FORMATS:
+        raise UnsupportedTranscriptFormatError(
+            "The original transcript has an unsupported file format."
+        )
+    meeting_directory = storage_directory / f"meeting_{meeting_id}"
+    meeting_directory.mkdir(parents=True, exist_ok=True)
+    destination = meeting_directory / original_name
+    temporary_path = meeting_directory / f".{destination.name}.{uuid4().hex}.tmp"
+    try:
+        temporary_path.write_bytes(content)
+        temporary_path.replace(destination)
+    except OSError:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return destination
+
+
+def store_cleaned_transcript(
+    *,
+    original_file_path: Path,
+    transcript: str,
+) -> Path:
+    destination = original_file_path.with_name(
+        f"{original_file_path.name}.cleaned.txt"
+    )
+    temporary_path = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+    try:
+        temporary_path.write_text(transcript, encoding="utf-8")
+        temporary_path.replace(destination)
+    except OSError:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return destination

@@ -1,21 +1,28 @@
+import asyncio
+from collections.abc import AsyncIterator
+from datetime import datetime, timezone
+import json
 from pathlib import Path as FilePath
+from time import monotonic
 from typing import Annotated
 from uuid import uuid4
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     File,
     HTTPException,
     Path,
     Query,
-    Response,
     UploadFile,
     status,
 )
+from fastapi.responses import StreamingResponse
 
 from app.api.dependencies import get_meeting_repository
 from app.config import get_settings
+from app.rag.components import CHROMA_COLLECTION_NAME
 from app.repositories.protocols import MeetingRepository as MeetingRepositoryProtocol
 from app.services.indexing import (
     cleanup_meeting_vectors,
@@ -27,6 +34,8 @@ from app.services.transcripts import (
     TranscriptExtractionError,
     UnsupportedTranscriptFormatError,
     extract_transcript,
+    store_cleaned_transcript,
+    store_original_transcript,
 )
 from app.schemas.meeting import (
     MeetingCreate,
@@ -35,6 +44,7 @@ from app.schemas.meeting import (
     MeetingIndexSummaryListResponse,
     MeetingListResponse,
     MeetingResponse,
+    MeetingUploadMetadata,
     MeetingUpdate,
 )
 
@@ -53,9 +63,10 @@ RepositoryDependency = Annotated[
 def create_meeting(
     meeting: MeetingCreate,
     repository: RepositoryDependency,
+    background_tasks: BackgroundTasks,
 ) -> MeetingResponse:
     record = repository.create(meeting, uuid4())
-    return start_meeting_index(repository, record, get_settings())
+    return start_meeting_index(repository, record, get_settings(), background_tasks)
 
 
 @router.post(
@@ -65,14 +76,19 @@ def create_meeting(
 )
 async def upload_meeting(
     repository: RepositoryDependency,
+    background_tasks: BackgroundTasks,
     file: Annotated[UploadFile, File(...)],
 ) -> MeetingResponse:
     filename = file.filename or ""
-    title = FilePath(filename).stem.strip()
-    if not title or len(title) > 200:
+    original_name = FilePath(filename).name
+    title = FilePath(original_name).stem.strip()
+    if not title or len(title) > 200 or len(original_name) > 255:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="The uploaded filename must produce a title of 1 to 200 characters.",
+            detail=(
+                "The uploaded filename must produce a title of 1 to 200 characters "
+                "and be no longer than 255 characters."
+            ),
         )
 
     try:
@@ -102,7 +118,37 @@ async def upload_meeting(
         transcript=transcript,
     )
     record = repository.create(meeting, uuid4())
-    return start_meeting_index(repository, record, get_settings())
+    settings = get_settings()
+    try:
+        original_file_path = store_original_transcript(
+            meeting_id=record.id,
+            filename=original_name,
+            content=content,
+            storage_directory=settings.transcript_storage_directory,
+        )
+        cleaned_text_path = store_cleaned_transcript(
+            original_file_path=original_file_path,
+            transcript=transcript,
+        )
+    except OSError as error:
+        repository.delete(record.id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="The original transcript could not be stored locally.",
+        ) from error
+    repository.set_upload_metadata(
+        record.id,
+        MeetingUploadMetadata(
+            file_name=original_name,
+            file_type=FilePath(original_name).suffix.lower(),
+            file_size=len(content),
+            uploaded_at=datetime.now(timezone.utc),
+            original_file_path=str(original_file_path),
+            cleaned_text_path=str(cleaned_text_path),
+            chroma_collection=CHROMA_COLLECTION_NAME,
+        ),
+    )
+    return start_meeting_index(repository, record, settings, background_tasks)
 
 
 @router.get("", response_model=MeetingListResponse)
@@ -153,6 +199,48 @@ def list_meeting_index_status(
     )
 
 
+@router.get("/{meeting_id}/index-status/events")
+def stream_meeting_indexing_status(
+    meeting_id: Annotated[int, Path(ge=1)],
+    repository: RepositoryDependency,
+) -> StreamingResponse:
+    repository.get(meeting_id)
+
+    async def events() -> AsyncIterator[str]:
+        previous_payload: str | None = None
+        last_heartbeat = monotonic()
+        while True:
+            meeting = repository.get(meeting_id)
+            status_response = get_meeting_index_status(
+                meeting.id,
+                meeting.indexing_task_id,
+                meeting.indexing_status,
+                meeting.indexing_error,
+                get_settings(),
+            )
+            serialized_payload = json.dumps(
+                status_response.model_dump(mode="json")
+            )
+            if serialized_payload != previous_payload:
+                yield f"data: {serialized_payload}\n\n"
+                previous_payload = serialized_payload
+            if status_response.status not in ("pending", "processing"):
+                return
+            if monotonic() - last_heartbeat >= 15:
+                yield ": keep-alive\n\n"
+                last_heartbeat = monotonic()
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.get("/{meeting_id}", response_model=MeetingResponse)
 def get_meeting(
     meeting_id: Annotated[int, Path(ge=1)],
@@ -187,14 +275,11 @@ def get_meeting_indexing_status(
 def reindex_meeting(
     meeting_id: Annotated[int, Path(ge=1)],
     repository: RepositoryDependency,
-    response: Response,
+    background_tasks: BackgroundTasks,
 ) -> MeetingResponse:
     record = repository.queue_indexing(meeting_id, uuid4())
     settings = get_settings()
-    result = start_meeting_index(repository, record, settings)
-    if settings.indexing_mode == "local":
-        response.status_code = status.HTTP_200_OK
-    return result
+    return start_meeting_index(repository, record, settings, background_tasks)
 
 
 @router.put("/{meeting_id}", response_model=MeetingResponse)
@@ -202,9 +287,15 @@ def update_meeting(
     meeting_id: Annotated[int, Path(ge=1)],
     meeting: MeetingUpdate,
     repository: RepositoryDependency,
+    background_tasks: BackgroundTasks,
 ) -> MeetingResponse:
     record = repository.update(meeting_id, meeting, uuid4())
-    return start_meeting_index(repository, record, get_settings())
+    return start_meeting_index(
+        repository,
+        record,
+        get_settings(),
+        background_tasks,
+    )
 
 
 @router.delete(

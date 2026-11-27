@@ -3,6 +3,7 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
+from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
@@ -232,6 +233,7 @@ def answer_question(
     request: ChatRequest,
     repository: MeetingRepository,
     settings: Settings,
+    retrieved_documents: list[Document] | None = None,
 ) -> ChatResponse:
     small_talk_answer = SMALL_TALK.get(request.question.lower().strip())
     if small_talk_answer is not None:
@@ -243,63 +245,87 @@ def answer_question(
         answer = create_chat_model(settings).invoke(prompt)
         return ChatResponse(answer=answer, sources=[])
 
-    vector_store = create_vector_store(settings)
-    retrieved = vector_store.similarity_search(request.question, k=4)
+    if retrieved_documents is None:
+        vector_store = create_vector_store(settings)
+        retrieved = vector_store.similarity_search(request.question, k=4)
+    else:
+        retrieved = retrieved_documents
     sources: list[ChatSource] = []
     context_sections: list[str] = []
     include_evidence = _requests_evidence(request.question)
 
     for document in retrieved:
         meeting_id = int(document.metadata["meeting_id"])
+        meeting_title = _metadata_text(
+            document.metadata,
+            "transcript_name",
+            "meeting_title",
+        )
+        meeting_date = None
+        meeting = None
         try:
             meeting = repository.get(meeting_id)
         except MeetingNotFoundError:
-            continue
-        if str(meeting.indexing_task_id) != document.metadata.get("indexing_task_id"):
-            continue
-        if meeting.indexing_status not in ("indexed", "queued", "indexing"):
-            continue
-        if meeting.indexing_status != "indexed":
-            if settings.indexing_mode != "celery":
+            if not document.metadata.get("indexing_task_id"):
                 continue
-            try:
-                task_state = celery_app.AsyncResult(
-                    str(meeting.indexing_task_id)
-                ).state
-            except RedisError as error:
-                logger.warning(
-                    "Could not check task status for meeting %s (%s)",
-                    meeting.id,
-                    type(error).__name__,
-                )
-                raise RAGDependencyError(
-                    "Redis is unavailable, so meeting indexing status cannot be "
-                    "verified. Check REDIS_URL and the Redis service."
-                ) from error
-            if task_state != "SUCCESS":
+            meeting_date_value = _metadata_text(document.metadata, "meeting_date")
+            if meeting_date_value:
+                try:
+                    meeting_date = datetime.fromisoformat(meeting_date_value)
+                except ValueError:
+                    logger.warning(
+                        "Ignoring invalid meeting date metadata for meeting %s",
+                        meeting_id,
+                    )
+        else:
+            if str(meeting.indexing_task_id) != document.metadata.get("indexing_task_id"):
                 continue
+            if meeting.indexing_status not in ("ready", "pending", "processing"):
+                continue
+            if meeting.indexing_status != "ready":
+                if settings.indexing_mode != "celery":
+                    continue
+                try:
+                    task_state = celery_app.AsyncResult(
+                        str(meeting.indexing_task_id)
+                    ).state
+                except RedisError as error:
+                    logger.warning(
+                        "Could not check task status for meeting %s (%s)",
+                        meeting.id,
+                        type(error).__name__,
+                    )
+                    raise RAGDependencyError(
+                        "Redis is unavailable, so meeting indexing status cannot be "
+                        "verified. Check REDIS_URL and the Redis service."
+                    ) from error
+                if task_state != "SUCCESS":
+                    continue
+            meeting_title = meeting_title or meeting.title
+            meeting_date = meeting.meeting_date
 
+        source_title = meeting_title or "Meeting Transcript"
+        source_meeting_id = meeting.id if meeting is not None else meeting_id
         source_id = f"S{len(sources) + 1}"
-        metadata = document.metadata
-        transcript_name = (
-            _metadata_text(metadata, "transcript_name", "meeting_title")
-            or meeting.title
-        )
         sources.append(
             ChatSource(
                 source_id=source_id,
-                meeting_id=meeting.id,
-                meeting_title=transcript_name,
-                meeting_date=meeting.meeting_date,
-                chunk_index=_metadata_chunk_index(metadata),
-                speaker_name=_metadata_text(metadata, "speaker_name", "speaker"),
-                timestamp=_metadata_timestamp(metadata),
+                meeting_id=source_meeting_id,
+                meeting_title=source_title,
+                meeting_date=meeting_date,
+                chunk_index=_metadata_chunk_index(document.metadata),
+                speaker_name=_metadata_text(
+                    document.metadata,
+                    "speaker_name",
+                    "speaker",
+                ),
+                timestamp=_metadata_timestamp(document.metadata),
                 excerpt=document.page_content if include_evidence else None,
             )
         )
         context_sections.append(
-            f"[{source_id}] Meeting: {meeting.title}\n"
-            f"Meeting date: {_format_date(meeting.meeting_date)}\n"
+            f"[{source_id}] Meeting: {source_title}\n"
+            f"Meeting date: {_format_date(meeting_date)}\n"
             f"Transcript excerpt:\n{document.page_content}"
         )
 

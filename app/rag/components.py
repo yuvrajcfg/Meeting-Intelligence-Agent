@@ -11,6 +11,8 @@ import requests
 
 from app.config import Settings
 
+CHROMA_COLLECTION_NAME = "meeting_transcripts"
+
 
 class RAGConfigurationError(RuntimeError):
     pass
@@ -207,10 +209,12 @@ class CustomEmbeddings(Embeddings):
 
 
 def create_chroma_client(settings: Settings) -> ClientAPI:
-    return chromadb.HttpClient(
-        host=settings.chroma_host,
-        port=settings.chroma_port,
-    )
+    if settings.chroma_host:
+        return chromadb.HttpClient(
+            host=settings.chroma_host,
+            port=settings.chroma_port,
+        )
+    return chromadb.PersistentClient(path=str(settings.chroma_persist_directory))
 
 
 def _secret_value(value: SecretStr | None) -> str:
@@ -269,7 +273,7 @@ def create_chat_model(settings: Settings) -> CustomLLM:
 def create_vector_store(settings: Settings) -> Chroma:
     return Chroma(
         client=create_chroma_client(settings),
-        collection_name="meeting_transcripts",
+        collection_name=CHROMA_COLLECTION_NAME,
         embedding_function=create_embeddings(settings),
         collection_metadata={"hnsw:space": "cosine"},
     )

@@ -32,7 +32,7 @@ class RagSourceResponseTests(unittest.TestCase):
         self.repository.set_indexing_status(
             self.meeting.id,
             self.task_id,
-            "indexed",
+            "ready",
         )
         self.document = Document(
             page_content="Private transcript chunk contents.",
@@ -103,6 +103,25 @@ class RagSourceResponseTests(unittest.TestCase):
         self.assertIsNone(source.speaker_name)
         self.assertIsNone(source.timestamp)
         self.assertIsNone(source.excerpt)
+
+    def test_persistent_chroma_sources_work_after_meeting_records_reset(self) -> None:
+        repository_after_restart = InMemoryMeetingRepository()
+        with (
+            patch(
+                "app.rag.answering.create_vector_store",
+                return_value=self.vector_store,
+            ),
+            patch("app.rag.answering.create_chat_model", return_value=self.model),
+        ):
+            response = answer_question(
+                request=ChatRequest(question="Who owns the task?"),
+                repository=repository_after_restart,
+                settings=self.settings,
+            )
+
+        self.assertEqual(response.sources[0].meeting_id, self.meeting.id)
+        self.assertEqual(response.sources[0].meeting_title, "Meeting Transcript 1")
+        self.assertIn("Private transcript chunk contents.", self.prompt_texts[-1])
 
 
 class SourceApiResponseTests(unittest.TestCase):

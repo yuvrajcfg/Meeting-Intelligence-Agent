@@ -1,0 +1,11 @@
+{
+  "top_k": 4,
+  "cases": [
+    {
+      "query": "Who owns the API integration task?",
+      "relevant_chunk_ids": [
+        "meeting-1-chunk-2"
+      ]
+    }
+  ]
+}

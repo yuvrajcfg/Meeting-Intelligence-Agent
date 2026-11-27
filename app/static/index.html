@@ -152,10 +152,6 @@
     @media (prefers-reduced-motion: reduce) {
       .typing-dots span { animation: none; }
     }
-    .sources { display: grid; gap: 8px; margin-top: 12px; }
-    .sources-heading { color: #64728c; font-size: .82rem; }
-    .source { padding: 10px 12px; border-left: 3px solid #7288ea; border-radius: 0 9px 9px 0; background: #f7f8fc; font-size: .9rem; }
-    .source p { margin: 6px 0 0; color: #5c6980; white-space: pre-wrap; }
     .chat-form { display: flex; gap: 10px; margin-top: 14px; }
     .input-hint { margin: 7px 2px 0; color: #8792a5; font-size: .78rem; }
     textarea {
@@ -439,7 +435,9 @@
     const selectedFilePanel = document.getElementById("selected-file");
     const uploadButton = document.getElementById("upload-button");
     const uploadStatus = document.getElementById("upload-status");
+    const statusStreams = new Map();
     let selectedFile = null;
+    let recentlyUploadedMeetingId = null;
 
     questionInput.addEventListener("keydown", (event) => {
       if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
@@ -472,42 +470,13 @@
       return payload;
     }
 
-    function addMessage(role, text, sources = []) {
+    function addMessage(role, text) {
       document.getElementById("empty-chat")?.remove();
       const message = document.createElement("article");
       message.className = `message ${role}`;
       const content = document.createElement("div");
       content.textContent = text;
       message.appendChild(content);
-
-      if (sources.length) {
-        const sourceList = document.createElement("div");
-        sourceList.className = "sources";
-        const sourceHeading = document.createElement("strong");
-        sourceHeading.className = "sources-heading";
-        sourceHeading.textContent = "Sources";
-        sourceList.appendChild(sourceHeading);
-        for (const source of sources) {
-          const item = document.createElement("section");
-          item.className = "source";
-          const heading = document.createElement("strong");
-          const fields = [`[${source.source_id}] ${source.meeting_title}`];
-          if (source.chunk_index !== null && source.chunk_index !== undefined) {
-            fields.push(`Chunk ${source.chunk_index}`);
-          }
-          if (source.speaker_name) fields.push(source.speaker_name);
-          if (source.timestamp) fields.push(source.timestamp);
-          heading.textContent = fields.join(" | ");
-          item.appendChild(heading);
-          if (source.excerpt) {
-            const excerpt = document.createElement("p");
-            excerpt.textContent = source.excerpt;
-            item.appendChild(excerpt);
-          }
-          sourceList.appendChild(item);
-        }
-        message.appendChild(sourceList);
-      }
       messages.appendChild(message);
       messages.scrollTop = messages.scrollHeight;
     }
@@ -548,7 +517,7 @@
           body: JSON.stringify({ question, history: history.slice(-8) }),
         });
         typingIndicator.remove();
-        addMessage("assistant", response.answer, response.sources);
+        addMessage("assistant", response.answer);
         history.push({ role: "user", content: question });
         history.push({ role: "assistant", content: response.answer });
       } catch (error) {
@@ -643,6 +612,7 @@
           `Uploaded "${meeting.title}" (meeting #${meeting.id}); indexing ${meeting.indexing_status}.`,
           "success",
         );
+        recentlyUploadedMeetingId = meeting.id;
         await refreshMeetings();
       } catch (error) {
         setUploadStatus(`Upload failed: ${error.message}`, "error");
@@ -651,7 +621,40 @@
       }
     });
 
+    function watchIndexingStatus(meeting, update) {
+      const eventSource = new EventSource(
+        `${apiPrefix}/meetings/${meeting.meeting_id}/index-status/events`,
+      );
+      statusStreams.set(meeting.meeting_id, eventSource);
+      eventSource.onmessage = (event) => {
+        const status = JSON.parse(event.data);
+        update(status);
+        if (status.status === "ready" || status.status === "failed") {
+          eventSource.close();
+          if (statusStreams.get(meeting.meeting_id) === eventSource) {
+            statusStreams.delete(meeting.meeting_id);
+          }
+        }
+      };
+    }
+
+    function updateUploadIndexingStatus(meetingId, title, status) {
+      if (meetingId !== recentlyUploadedMeetingId) return;
+      if (status.status === "ready") {
+        setUploadStatus(`"${title}" is indexed and ready.`, "success");
+      } else if (status.status === "failed") {
+        setUploadStatus(
+          `Indexing "${title}" failed: ${status.error || "Check the server logs."}`,
+          "error",
+        );
+      } else {
+        setUploadStatus(`Indexing "${title}": ${status.status}...`);
+      }
+    }
+
     async function refreshMeetings() {
+      for (const eventSource of statusStreams.values()) eventSource.close();
+      statusStreams.clear();
       const list = document.getElementById("meetings");
       list.replaceChildren(Object.assign(document.createElement("span"), {
         className: "loading",
@@ -675,10 +678,15 @@
           label.className = "meeting-label";
           label.textContent = `#${meeting.meeting_id} · ${meeting.title} — ${meeting.indexing_status}`;
           if (meeting.indexing_error) label.textContent += ` (${meeting.indexing_error})`;
+          updateUploadIndexingStatus(meeting.meeting_id, meeting.title, {
+            status: meeting.indexing_status,
+            error: meeting.indexing_error,
+          });
           const retry = document.createElement("button");
           retry.type = "button";
           retry.className = "secondary-button";
           retry.textContent = meeting.indexing_status === "failed" ? "Retry" : "Re-index";
+          retry.disabled = ["pending", "processing"].includes(meeting.indexing_status);
           retry.addEventListener("click", async () => {
             retry.disabled = true;
             try {
@@ -691,6 +699,16 @@
           });
           row.append(label, retry);
           list.appendChild(row);
+
+          if (["pending", "processing"].includes(meeting.indexing_status)) {
+            watchIndexingStatus(meeting, (status) => {
+              label.textContent = `#${meeting.meeting_id} · ${meeting.title} — ${status.status}`;
+              if (status.error) label.textContent += ` (${status.error})`;
+              retry.textContent = status.status === "failed" ? "Retry" : "Re-index";
+              retry.disabled = ["pending", "processing"].includes(status.status);
+              updateUploadIndexingStatus(meeting.meeting_id, meeting.title, status);
+            });
+          }
         }
       } catch (error) {
         list.textContent = error.message;

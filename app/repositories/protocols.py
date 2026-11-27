@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
@@ -9,6 +10,7 @@ from app.schemas.meeting import (
     MeetingIndexSummary,
     IndexingStatus,
     MeetingResponse,
+    MeetingUploadMetadata,
     MeetingUpdate,
 )
 
@@ -52,10 +54,19 @@ class MeetingRepository(Protocol):
         indexing_task_id: UUID,
     ) -> MeetingResponse: ...
 
+    def set_upload_metadata(
+        self,
+        meeting_id: int,
+        metadata: MeetingUploadMetadata,
+    ) -> None: ...
+
     def set_indexing_status(
         self,
         meeting_id: int,
         indexing_task_id: UUID,
         status: IndexingStatus,
         error: str | None = None,
+        *,
+        indexed_at: datetime | None = None,
+        chunk_count: int | None = None,
     ) -> None: ...

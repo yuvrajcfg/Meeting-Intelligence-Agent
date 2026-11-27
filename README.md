@@ -9,21 +9,26 @@ other details without rereading long transcripts.
 - Upload `.txt`, `.md`, `.pdf`, `.docx`, and `.vtt` transcripts, up to 10 MB.
 - Extract transcript text and split it into 500-token chunks with 75-token overlap.
 - Create 736-dimensional embeddings through the configured embedding provider.
-- Store and search vectors in ChromaDB using cosine similarity.
+- Keep original uploaded files under `storage/transcripts/` and store/search vectors in
+  persistent local ChromaDB using cosine similarity.
+- Store file, upload, indexing, and storage-path metadata with each ChromaDB chunk.
+- Stream indexing status changes to the browser over Server-Sent Events (SSE).
+- Evaluate retrieval and generated citations with an offline question dataset.
 - Retrieve the top four relevant chunks and answer with source citations such as `[S1]`.
 - Return compact source metadata by default; return full chunk evidence when explicitly
   requested (for example, “show evidence”).
 - Handle common greetings and thanks with an LLM response without transcript retrieval.
-- Provide meeting CRUD, indexing status, a browser chat, and API documentation.
-- Use synchronous local indexing by default, with the Celery/Redis path retained as an
-  optional mode.
+- Provide meeting CRUD, background indexing status, a browser chat, and API documentation.
+- Use local persistent ChromaDB and background indexing by default, with remote ChromaDB
+  and the Celery/Redis path available as optional modes.
 
 Main endpoints:
 
 - `GET /api/v1/health`
 - Meeting CRUD under `/api/v1/meetings`; upload at `POST /api/v1/meetings/upload`
 - Reindex at `POST /api/v1/meetings/{meeting_id}/index`; status at
-  `GET /api/v1/meetings/{meeting_id}/index-status`
+  `GET /api/v1/meetings/{meeting_id}/index-status`; live status events at
+  `GET /api/v1/meetings/{meeting_id}/index-status/events`
 - `POST /api/v1/chat` and `POST /api/v1/ask`
 
 ## Architecture
@@ -33,7 +38,7 @@ Transcript
     → Loader
     → Chunking
     → Embeddings
-    → ChromaDB
+    → Persistent ChromaDB
     → Retriever
     → LLM
     → Answer with citations
@@ -72,6 +77,7 @@ app/
 │   ├── answering.py              # Retrieval, prompt construction, citations, and abstention
 │   ├── components.py             # Custom model clients, Chroma client, and vector store
 │   └── indexing.py               # Chunking and writing transcript documents to Chroma
+├── evaluation.py                 # Offline retrieval and citation metrics
 ├── repositories/
 │   ├── protocols.py              # Meeting repository interface
 │   ├── meeting_repository.py     # In-memory repository
@@ -81,8 +87,8 @@ app/
 │   ├── chat.py                   # Chat, history, and source models
 │   └── meeting.py                # Meeting CRUD and indexing-status models
 ├── services/
-│   ├── indexing.py               # Local/Celery indexing dispatch and vector cleanup
-│   └── transcripts.py            # Upload validation and TXT/MD/PDF/DOCX/VTT extraction
+│   ├── indexing.py               # Background/Celery indexing dispatch and vector cleanup
+│   └── transcripts.py            # Upload validation, local original storage, and extraction
 ├── static/
 │   └── index.html                # Browser chat and transcript-upload interface
 ├── workers/
@@ -93,10 +99,16 @@ app/
 └── main.py                       # FastAPI app, repository setup, and static chat routes
 sql/
 └── 001_meetings.sql              # SQL Server table, index, and stored procedures
+evaluation/
+└── dataset.example.json          # Example labeled retrieval/citation evaluation set
 tests/
 ├── test_chat_provider.py         # Custom chat-provider and LCEL tests
 ├── test_embedding_provider.py    # Custom embedding-provider tests
 ├── test_local_indexing.py        # Local and optional Celery indexing tests
+├── test_transcript_storage.py    # Original-upload storage and upload API tests
+├── test_rag_indexing.py          # Chroma chunk metadata tests
+├── test_indexing_status_events.py # SSE indexing lifecycle tests
+├── test_evaluation.py            # Offline evaluation metric tests
 ├── test_rag_small_talk.py        # Small-talk routing tests
 └── test_rag_sources.py           # Source metadata and evidence-response tests
 .env.example                      # Safe configuration template
@@ -116,10 +128,18 @@ and citations are returned and displayed.
 2. The loader extracts text and rejects unsupported, empty, or oversized files.
 3. `RecursiveCharacterTextSplitter` creates 500-token chunks with a 75-token overlap,
    using `cl100k_base`.
-4. The embedding client sends each chunk to the configured endpoint and validates the
+4. The original uploaded file is saved with its supplied filename under
+   `storage/transcripts/meeting_<id>/`, keeping uploads with duplicate names separate.
+   The cleaned transcript is saved alongside it with `.cleaned.txt` appended to the
+   original filename.
+5. Local-mode indexing runs after the upload response is returned. Status moves from
+   `pending` to `processing`, then to `ready` or `failed`; the browser receives changes
+   over the meeting's SSE status endpoint.
+6. The embedding client sends each chunk to the configured endpoint and validates the
    returned 736-value vector.
-5. Chunks, vectors, and meeting metadata are stored in the `meeting_transcripts` Chroma
-   collection.
+7. Chunks, vectors, and metadata (`meeting_id`, title/date, original filename/type/size,
+   upload/index timestamps, status, chunk count, errors, file paths, and Chroma collection)
+   are stored in the `meeting_transcripts` collection under `storage/chroma` by default.
 
 The built-in indexer records meeting title, date, chunk index, and indexing task ID.
 Speaker and timestamp are shown in citations only if those fields are present in document
@@ -130,11 +150,27 @@ metadata; the indexer does not currently extract them from transcript text.
 1. The user submits a question to `/api/v1/chat` or `/api/v1/ask`.
 2. Common small-talk matches go directly to the LLM with a suggested reply.
 3. Other questions are embedded and used to retrieve the top four transcript chunks.
-4. Stale or unindexed documents are excluded; the remaining excerpts are added to the
-   prompt as sources `[S1]`, `[S2]`, and so on.
+4. Stale or unindexed documents are excluded; persisted Chroma metadata also allows
+   indexed sources to remain queryable after the in-memory meeting repository resets.
+   The remaining excerpts are added to the prompt as sources `[S1]`, `[S2]`, and so on.
 5. The LLM generates a grounded answer with citations.
 6. The response displays compact source metadata. Full chunk text is included only when
    the question explicitly requests evidence, such as “show supporting text”.
+
+## Offline Evaluation
+
+Create a JSON dataset with test questions and the IDs of chunks expected to answer each
+question. Use [`evaluation/dataset.example.json`](./evaluation/dataset.example.json) as a
+template. Chunk IDs have the form `meeting-<meeting_id>-chunk-<chunk_index>`. Run:
+
+```powershell
+python -m app.evaluation evaluation/dataset.json
+```
+
+The evaluator uses the configured embedding and chat providers and reports mean
+precision@k, recall@k, MRR@k, hit rate@k, citation precision, and citation recall, along
+with per-question results. This is an offline evaluation tool; it does not run as part of
+transcript uploads.
 
 ## Environment Variables
 
@@ -160,8 +196,10 @@ is ignored by Git; do not commit provider keys or connection strings.
 | `EMBEDDING_BASE_URL` | Legacy alternative; `/embeddings` is appended unless already present | — |
 | `EMBEDDING_DIMENSIONS` | Expected and requested vector dimensions | `736` |
 | `REDIS_URL` | Celery broker and result backend in `celery` mode | `redis://localhost:6379/0` |
-| `CHROMA_HOST` | ChromaDB host | `localhost` |
-| `CHROMA_PORT` | ChromaDB host port | `8001` |
+| `TRANSCRIPT_STORAGE_DIRECTORY` | Directory for original uploaded files | `storage/transcripts` |
+| `CHROMA_PERSIST_DIRECTORY` | Local persistent ChromaDB directory | `storage/chroma` |
+| `CHROMA_HOST` | Optional remote ChromaDB host; when set, use remote mode | — |
+| `CHROMA_PORT` | Remote ChromaDB port | `8001` |
 
 The chat provider request uses the complete `LLM_BASE_URL` and sends `model`, `messages`,
 `temperature`, `top_p`, and `max_tokens`. The embedding request sends `texts` and
@@ -170,9 +208,9 @@ endpoints and keys according to your provider's documentation.
 
 ## Run Locally
 
-The default `INDEXING_MODE=local` indexes synchronously in the FastAPI process. Redis and
-a Celery worker are not needed, but the ChromaDB service and model-provider endpoints must
-be reachable.
+The default `INDEXING_MODE=local` indexes in a FastAPI background task. Redis, Celery, and
+a separate ChromaDB service are not needed. Uploaded originals and the ChromaDB database
+are stored locally; the configured model-provider endpoints must be reachable.
 
 ### 1. Create a virtual environment and install dependencies
 
@@ -188,15 +226,7 @@ python -m pip install -r requirements.txt
 Create `.env` from `.env.example` only if you do not already have one, then configure the
 LLM, embedding provider, and Chroma settings.
 
-### 2. Start ChromaDB
-
-In a separate terminal:
-
-```powershell
-.\.venv\Scripts\chroma.exe run --host 127.0.0.1 --port 8001 --path "$env:LOCALAPPDATA\MeetingIntelligenceAgent\chroma"
-```
-
-### 3. Start FastAPI
+### 2. Start FastAPI
 
 ```powershell
 python -m uvicorn app.main:app --reload
@@ -206,9 +236,13 @@ Open the chat at <http://127.0.0.1:8000/chat>, API docs at
 <http://127.0.0.1:8000/docs>, or health status at
 <http://127.0.0.1:8000/api/v1/health>.
 
-Local create, update, upload, and reindex requests wait for embedding and storage to finish.
-Use `DATABASE_BACKEND=memory` for a simple local setup; in-memory meeting records are lost
-when the FastAPI process stops.
+Local create, update, upload, and reindex requests return while indexing is pending; the
+browser listens to SSE for status changes, and API clients can connect to the same event
+endpoint. ChromaDB vectors and original
+uploads survive application restarts. The default in-memory meeting repository still loses
+meeting CRUD records when the FastAPI process stops; use `DATABASE_BACKEND=sqlserver` when
+meeting records and status must also survive restarts. Existing remote ChromaDB deployments
+can be selected by setting `CHROMA_HOST` and `CHROMA_PORT`.
 
 ### Optional: Celery and Redis
 
@@ -236,7 +270,7 @@ python -m unittest discover -s tests -v
 ## Design Decisions
 
 - **ChromaDB:** provides persistent vector storage and cosine-similarity search locally or
-  as a service.
+  as a remote service.
 - **Embeddings:** represent text by semantic meaning, so a query can find relevant passages
   even when it uses different words from the transcript.
 - **500-token chunks with 75-token overlap:** keep passages small enough for retrieval and
@@ -247,9 +281,9 @@ python -m unittest discover -s tests -v
 
 ## Current Limitations
 
-- Local synchronous indexing is the default and can make upload or update requests take
-  time for long transcripts. The current embedding adapter sends one text per provider
-  request. Celery/Redis support is implemented but disabled by default.
+- The default in-memory meeting repository loses meeting CRUD records on restart, although
+  local transcript files and ChromaDB vectors persist. The current embedding adapter sends
+  one text per provider request. Celery/Redis support is implemented but disabled by default.
 - Blob Storage and shared-drive ingestion are not implemented.
 - Speaker and timestamp metadata are not currently extracted by the built-in indexer.
 - PDF OCR is not supported; PDFs need extractable text.
@@ -259,10 +293,10 @@ python -m unittest discover -s tests -v
 
 ## Future Enhancements
 
-- Enable Redis and Celery background indexing for production workloads.
+- Use SQL Server for durable meeting records and enable Redis/Celery background indexing
+  for production workloads.
 - Add Blob Storage and shared-drive integrations.
 - Add authentication and authorization.
-- Add retrieval and answer evaluation metrics.
 - Extract speaker and timestamp metadata during transcript ingestion.
 
 ## Example Questions

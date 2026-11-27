@@ -6,9 +6,9 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 IndexingStatus = Literal[
     "not_indexed",
-    "queued",
-    "indexing",
-    "indexed",
+    "pending",
+    "processing",
+    "ready",
     "failed",
 ]
 
@@ -34,6 +34,16 @@ class MeetingUpdate(MeetingCreate):
     pass
 
 
+class MeetingUploadMetadata(BaseModel):
+    file_name: str = Field(min_length=1, max_length=255)
+    file_type: str = Field(min_length=1, max_length=20)
+    file_size: int = Field(ge=0)
+    uploaded_at: datetime
+    original_file_path: str = Field(min_length=1, max_length=1000)
+    cleaned_text_path: str = Field(min_length=1, max_length=1000)
+    chroma_collection: str = Field(min_length=1, max_length=100)
+
+
 class MeetingResponse(BaseModel):
     id: int = Field(gt=0)
     title: str
@@ -43,7 +53,18 @@ class MeetingResponse(BaseModel):
     updated_at: datetime
     indexing_task_id: UUID | None = None
     indexing_status: IndexingStatus = "not_indexed"
+    status: IndexingStatus = "not_indexed"
     indexing_error: str | None = None
+    error_message: str | None = None
+    file_name: str | None = None
+    file_type: str | None = None
+    file_size: int | None = Field(default=None, ge=0)
+    uploaded_at: datetime | None = None
+    indexed_at: datetime | None = None
+    chunk_count: int | None = Field(default=None, ge=0)
+    original_file_path: str | None = None
+    cleaned_text_path: str | None = None
+    chroma_collection: str | None = None
 
 
 class MeetingIndexStatusResponse(BaseModel):
